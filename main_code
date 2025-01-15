@@ -1,0 +1,270 @@
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(stringr)
+library(openxlsx)
+library(readxl)
+library(caret)
+library(randomForest)
+library(glmnet)
+library(pROC)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(DESeq2)
+library(gage)
+library(clusterProfiler)
+library(edgeR)
+library(Hmisc)
+library(matrixTests)
+library(ggplot2)
+library(cowplot)
+library(grid)
+library(gridExtra)
+
+go.hs <- go.gsets(species="human")
+go.bp.gs <- go.hs$go.sets[go.hs$go.subs$BP]
+go.mf.gs <- go.hs$go.sets[go.hs$go.subs$MF]
+go.cc.gs <- go.hs$go.sets[go.hs$go.subs$CC]
+
+# Sensitivity dataframes
+
+# Sanger IC50 dataframe, combined from GDSC1_GDSC2
+icfull <- read_excel("AA_full_Sanger_IC50_wide_GDSC1_GDSC2.xlsx")
+
+# MTHi Sanger data
+mthi <- read_excel("AA_GDSC-sanger-MTH1_700CCL_IC50_wide.xlsx")
+colnames(mthi)[5]<-"tissue"
+
+# DepMap files
+# info on cell lines (needed for almost all read-ins)
+cell_info <- read_excel("B_cell_info.xlsx", col_names = FALSE) 
+colnames(cell_info)<-c("DepMap_ID", "name", "tissue", "sex")
+
+# Gene expression
+D22Q4.OmicsExpressionProteinCodingGenesTPMLogp1 <- read.csv("~/D22Q4 OmicsExpressionProteinCodingGenesTPMLogp1.csv")
+exp<-D22Q4.OmicsExpressionProteinCodingGenesTPMLogp1
+rm(D22Q4.OmicsExpressionProteinCodingGenesTPMLogp1)
+
+# clean up colnames
+a<-as.data.frame(colnames(exp[,-1]))
+colnames(a)<-"V1"
+a$V2<-word(a$V1,1,sep = "\\..")
+aa<-c("DepMap_ID", a$V2)
+colnames(exp)<-aa
+rm(a, aa)
+
+exp<-merge(cell_info, exp,  by = "DepMap_ID", all.y = TRUE)
+
+# get the needed column
+
+choice<-as.data.frame(cbind(icfull[,1:4], icfull$'KRAS (G12C) Inhibitor-12_1855_20_GDSC2'))
+colnames(choice)[5]<-"drug"
+choice<-choice[complete.cases(choice$drug),]
+# specify the drug name
+n<- "KRAS (G12C) Inhibitor-12 (20nmol, 1855, GDSC2)"
+
+# a function to loop through all the pathways and save the confusion matrices in a single file
+
+# Example of reading in a file with combinations
+# prespecified_combination_list <- read_excel("~/x_10_random combinations list 80000expression.xlsx")
+# sort the data first here for the top combinations
+# order
+# combinations_df <- prespecified_combination_list[1:50, 1:10]
+
+# copy the data in the excel file xxx
+prespecified_combination_list <- read_excel("xxx.xlsx")
+
+# if the variable"all" is taken it is needed to be split
+# Split the variable by blanks
+split_list <- strsplit(as.character(prespecified_combination_list$all), " ")
+
+# Find the maximum number of splits
+max_splits <- max(sapply(split_list, length))
+
+# Pad shorter rows with NA to ensure all have the same length
+split_padded <- lapply(split_list, function(x) {
+    length(x) <- max_splits
+    x
+})
+
+# Convert to a data frame
+combinations_df1  <- do.call(rbind, split_padded)
+
+# Rename the new columns
+colnames(combinations_df1) <- paste0("Column", 1:max_splits)
+
+combinations_df  <- combinations_df[1:1000,]
+
+
+
+# Initialize a list to store results
+results <- list()
+
+# Initialize a dataframe to store sample classifications
+combined_results <- NULL
+
+# Iterate over each row in combinations_df
+for (i in 1:nrow(combinations_df)) {
+    # Extract the column names for the current combination
+    pthw <- combinations_df[i, ]
+    pthw_name <- paste0("Combination", i)
+    
+    # Extract expression data for the current pathway
+    exp_pthw <- exp[, colnames(exp) %in% pthw]
+    
+    # Check if exp_pthw is not empty and has at least 10 columns
+    if (is.null(dim(exp_pthw)) || ncol(exp_pthw) < 2) {
+        next  # Skip to the next pathway if exp_pthw has fewer than 10 columns
+    }
+    
+    exp_pthw <- cbind(exp[, 1:4], exp_pthw)
+    
+    # Divide into blood and non-blood
+    blood <- c("Myeloma", "Lymphoma", "Leukemia")
+    
+    bl <- as.data.frame(choice[choice$tissue %in% blood, ])
+    nobl <- as.data.frame(choice[!choice$tissue %in% blood, ])
+    
+    bl <- bl[complete.cases(bl$drug), ]
+    nobl <- nobl[complete.cases(nobl$drug), ]
+    
+    df <- exp_pthw[, -(2:4)]
+    
+    bl <- merge(bl, df)
+    nobl <- merge(nobl, df)
+    
+    bl <- bl[order(bl$drug), ]
+    nobl <- nobl[order(nobl$drug), ]
+    
+    # Prepare for the random forest
+    X <- as.matrix(nobl[, 6:ncol(nobl)])
+    y <- nobl$drug
+    
+    # Compute the median of y
+    median_y <- median(y)
+    
+    # Classify y into binary groups based on the median
+    y_binary <- ifelse(y <= median_y, 0, 1) # 0 for values <= median, 1 for values > median
+    
+    # Add an identifier column
+    sample_id <- seq_along(y_binary)
+    
+    # Combine X and sample_id into a data frame for easier handling
+    data_combined <- data.frame(sample_id = sample_id, X)
+    data_combined$y <- y_binary
+    
+    # Split the data into training and testing sets
+    set.seed(141)
+    train_index <- createDataPartition(data_combined$y, p = 0.8, list = FALSE)
+    train_data <- data_combined[train_index, ]
+    test_data <- data_combined[-train_index, ]
+    
+    # Prepare the data for randomForest
+    X_train <- train_data[, -c(1, ncol(train_data))]
+    y_train <- train_data$y
+    
+    X_test <- test_data[, -c(1, ncol(test_data))]
+    y_test <- test_data$y
+    
+    # Fit the random forest model
+    set.seed(123)
+    rf_model <- randomForest(x = X_train, y = as.factor(y_train), ntree = 750, mtry = 4)
+    
+    # Predict on the testing set
+    predictions_test_prob <- predict(rf_model, newdata = X_test, type = "prob")
+    # Predict on the training set
+    predictions_train_prob <- predict(rf_model, newdata = X_train, type = "prob")
+    
+    # Convert predictions to class labels based on highest probability
+    predictions_train_class <- apply(predictions_train_prob, 1, function(x) which.max(x) - 1)
+    predictions_test_class <- apply(predictions_test_prob, 1, function(x) which.max(x) - 1)
+    
+    # Compute confusion matrices
+    conf_matrix_train <- confusionMatrix(as.factor(predictions_train_class), as.factor(y_train))
+    conf_matrix_test <- confusionMatrix(as.factor(predictions_test_class), as.factor(y_test))
+    
+    # Extract confusion matrix elements
+    train_cm <- as.vector(conf_matrix_train$table)
+    test_cm <- as.vector(conf_matrix_test$table)
+    
+    # Compute ROC and AUC for train and test sets
+    roc_train <- roc(y_train, predictions_train_prob[, 2])  # Use the probabilities for the positive class
+    auc_train <- auc(roc_train)
+    
+    roc_test <- roc(y_test, predictions_test_prob[, 2])  # Use the probabilities for the positive class
+    auc_test <- auc(roc_test)
+    
+    # Store the results in the results list
+    results[[pthw_name]] <- list(
+        pathway_name = pthw_name,
+        pathway_length = ncol(X),
+        train_cm_1_1 = train_cm[1], train_cm_1_2 = train_cm[2],
+        train_cm_2_1 = train_cm[3], train_cm_2_2 = train_cm[4],
+        test_cm_1_1 = test_cm[1], test_cm_1_2 = test_cm[2],
+        test_cm_2_1 = test_cm[3], test_cm_2_2 = test_cm[4],
+        accuracy_train = conf_matrix_train$overall['Accuracy'],
+        accuracy_test = conf_matrix_test$overall['Accuracy'],
+        precision_train = conf_matrix_train$byClass['Pos Pred Value'],
+        precision_test = conf_matrix_test$byClass['Pos Pred Value'],
+        recall_train = conf_matrix_train$byClass['Sensitivity'],
+        recall_test = conf_matrix_test$byClass['Sensitivity'],
+        f1_score_train = 2 * ((conf_matrix_train$byClass['Pos Pred Value'] * conf_matrix_train$byClass['Sensitivity']) /
+                                  (conf_matrix_train$byClass['Pos Pred Value'] + conf_matrix_train$byClass['Sensitivity'])),
+        f1_score_test = 2 * ((conf_matrix_test$byClass['Pos Pred Value'] * conf_matrix_test$byClass['Sensitivity']) /
+                                 (conf_matrix_test$byClass['Pos Pred Value'] + conf_matrix_test$byClass['Sensitivity'])),
+        auc_train = auc_train,
+        auc_test = auc_test
+    )
+    
+    # Update combined_results dataframe with predicted classes
+    if (is.null(combined_results)) {
+        combined_results <- data.frame(
+            SampleID = c(train_data$sample_id, test_data$sample_id),
+            Actual = c(y_train, y_test),
+            Dataset = c(rep("Train", length(y_train)), rep("Test", length(y_test))),
+            Predicted_Class_Combination1 = c(rep("Train", length(y_train)), predictions_test_class)
+        )
+    } else {
+        # Add new column for predicted classes of the current combination
+        combined_results <- cbind(
+            combined_results,
+            setNames(data.frame(c(rep("Train", length(y_train)), predictions_test_class)), paste0("Predicted_Class_", pthw_name))
+        )
+    }
+}
+
+# Convert the results to a data frame
+results_df <- do.call(rbind, lapply(names(results), function(pthw_name) {
+    res <- results[[pthw_name]]
+    data.frame(
+        pathway_name = res$pathway_name,
+        pathway_length = res$pathway_length,
+        train_cm_1_1 = res$train_cm_1_1, train_cm_1_2 = res$train_cm_1_2,
+        train_cm_2_1 = res$train_cm_2_1, train_cm_2_2 = res$train_cm_2_2,
+        test_cm_1_1 = res$test_cm_1_1, test_cm_1_2 = res$test_cm_1_2,
+        test_cm_2_1 = res$test_cm_2_1, test_cm_2_2 = res$test_cm_2_2,
+        accuracy_train = res$accuracy_train,
+        accuracy_test = res$accuracy_test,
+        precision_train = res$precision_train,
+        precision_test = res$precision_test,
+        recall_train = res$recall_train,
+        recall_test = res$recall_test,
+        f1_score_train = res$f1_score_train,
+        f1_score_test = res$f1_score_test,
+        auc_train = as.numeric(res$auc_train),
+        auc_test = as.numeric(res$auc_test),
+        my_sum = res$test_cm_1_1 + res$test_cm_2_2
+    )
+}))
+
+# Merge results with combinations_df
+# combinations_df$all <- apply(combinations_df, 1, paste, collapse = " ")
+all_df <- as.data.frame(cbind(results_df, combinations_df))
+
+# Order combined_results by SampleID
+combined_results <- combined_results[order(combined_results$SampleID), ]
+
+samples_fare_by_comb<-cbind(nobl[,1:5], combined_results)
+
+write.xlsx(all_df, paste0("rrseed1_test_existing", "_", ncol(combinations_df)-1, "_", nrow(all_df), "_of_", nrow(prespecified_combination_list),  "_", n, ".xlsx"))
+write.xlsx(samples_fare_by_comb, paste0("rrseed1_test_existing_samples_by_combination", "_", ncol(combinations_df)-1, "_", nrow(all_df), "_of_", nrow(prespecified_combination_list),  "_", n, ".xlsx"))
