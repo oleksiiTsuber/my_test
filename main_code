@@ -268,3 +268,5 @@ samples_fare_by_comb<-cbind(nobl[,1:5], combined_results)
 
 write.xlsx(all_df, paste0("rrseed1_test_existing", "_", ncol(combinations_df)-1, "_", nrow(all_df), "_of_", nrow(prespecified_combination_list),  "_", n, ".xlsx"))
 write.xlsx(samples_fare_by_comb, paste0("rrseed1_test_existing_samples_by_combination", "_", ncol(combinations_df)-1, "_", nrow(all_df), "_of_", nrow(prespecified_combination_list),  "_", n, ".xlsx"))
+
+#hi, mom!
